@@ -3171,27 +3171,32 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * preads run while the GPU computes; the missed subset follows in a second submit.
          * Per-subset CPU fallback on unresolved slab / bad fmt / GPU fault. */
         int is_miss[64]={0}; ColiMetalMoeHandle *mh=NULL;
-        int cpu_res=1, cpu_miss=1, mh_shared=0, nbb=0, Rtot=0, mfmt=-1, sh_in=0;
+        int cpu_res=1, cpu_miss=1, mh_shared=0, nbb=0, Rtot=0, mfmt=-1, sh_in=0, mbad=0;
         const void *MG[65],*MU[65],*MD[65]; const float *MGS[65],*MUS[65],*MDS[65];
         int xoffb[65],nrb[65];
         float *mxg=NULL; int *mrows=NULL; float *mrw=NULL;
         /* subset builder: experts with is_miss==WANTMISS (+ shared expert when TRY_SH) */
         #define MB_BUILD(WANTMISS, TRY_SH) do{ \
-            nbb=0; Rtot=0; mfmt=-1; sh_in=0; \
+            nbb=0; Rtot=0; mfmt=-1; sh_in=0; mbad=0; \
             for(int j=0;j<nb;j++){ if(is_miss[j]!=(WANTMISS)) continue; \
                 int eid=uniq[base+j]; ESlot *e=use[j]; int cnt=0; \
                 for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++) \
                     if(idxs[(int64_t)s*K+kk]==eid){ cnt++; break; } \
                 if(!cnt) continue; \
                 if(mfmt<0) mfmt=e->g.fmt; \
-                if(!eslot_fmt_uniform(e,mfmt)) continue;   /* mixed-precision expert: CPU path */ \
+                /* one subset, one format. A mismatched expert cannot be skipped: the row pass \
+                 * below walks the whole class and the CPU loop skips it via cpu_res/cpu_miss, so \
+                 * a per-member skip desyncs the batch AND drops the contribution. Abort the whole \
+                 * class to the CPU instead (same shape as the gs guard proposed on #587). */ \
+                if(!eslot_fmt_uniform(e,mfmt)){ mbad=1; break; } \
                 MG[nbb]=e->g.fmt==1?(const void*)e->g.q8:(const void*)e->g.q4; \
                 MU[nbb]=e->u.fmt==1?(const void*)e->u.q8:(const void*)e->u.q4; \
                 MD[nbb]=e->d.fmt==1?(const void*)e->d.q8:(const void*)e->d.q4; \
                 MGS[nbb]=e->g.s; MUS[nbb]=e->u.s; MDS[nbb]=e->d.s; \
                 xoffb[nbb]=Rtot; nrb[nbb]=cnt; Rtot+=cnt; nbb++; \
             } \
-            if(TRY_SH){ int shf = mfmt<0 ? l->sh_gate.fmt : mfmt; \
+            if(mbad){ nbb=0; Rtot=0; sh_in=0; } \
+            if(!mbad && TRY_SH){ int shf = mfmt<0 ? l->sh_gate.fmt : mfmt; \
                 if(c->n_shared==1 && sI==I && l->sh_gate.fmt==shf && l->sh_up.fmt==shf && l->sh_down.fmt==shf){ \
                     if(mfmt<0) mfmt=shf; \
                     MG[nbb]=shf==1?(const void*)l->sh_gate.q8:(const void*)l->sh_gate.q4; \
@@ -3200,7 +3205,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     MGS[nbb]=l->sh_gate.s; MUS[nbb]=l->sh_up.s; MDS[nbb]=l->sh_down.s; \
                     xoffb[nbb]=Rtot; nrb[nbb]=S; Rtot+=S; nbb++; sh_in=1; } } \
             int p=0; \
-            for(int j=0;j<nb;j++){ if(is_miss[j]!=(WANTMISS)) continue; int eid=uniq[base+j]; \
+            for(int j=0;!mbad && j<nb;j++){ if(is_miss[j]!=(WANTMISS)) continue; int eid=uniq[base+j]; \
                 for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++) \
                     if(idxs[(int64_t)s*K+kk]==eid){ \
                         memcpy(mxg+(int64_t)p*D, x+(int64_t)s*D, D*sizeof(float)); \
@@ -3214,7 +3219,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             mxg=falloc((int64_t)(nb+1)*S*D);
             mrows=xalloc((size_t)(nb+1)*S*sizeof(int),"moe mrows"); mrw=xalloc((size_t)(nb+1)*S*sizeof(float),"moe mrw");
             MB_BUILD(0, base==0 && !g_pre_sh);
-            if(nbb>0){
+            if(mbad){ /* mixed formats in the resident class: whole class stays on the CPU */ }
+            else if(nbb>0){
                 double t0=now_s();
                 mh=coli_metal_moe_block_begin(nbb,D,I,mfmt,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw);
                 m->t_emm += now_s()-t0;
@@ -3273,7 +3279,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 for(int q=0;q<nmiss;q++) pipe_wait(q);
                 m->t_ewait += now_s()-tw; }
             MB_BUILD(1, 0);                                   /* missed experts, now loaded */
-            if(nbb>0){
+            if(mbad){ /* mixed formats in the missed class: whole class stays on the CPU */ }
+            else if(nbb>0){
                 double t0=now_s();
                 if(coli_metal_moe_block(nbb,D,I,mfmt,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw,out,S)) cpu_miss=0;
                 m->t_emm += now_s()-t0;
