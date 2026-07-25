@@ -53,6 +53,39 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
     for (int i = slane; i < I; i += 32) {
       uchar b = wr[i>>2]; int v = (b >> (2*(i&3))) & 0x3; acc += float(v-2) * xr[i];
     }
+  } else if (fmt == 5) {                            // int3-g64: 24B/group, scale per (row,group)
+    int ng = (I + 63) / 64;
+    device const uchar* wr = w + (long)o * (long)ng * 24;
+    device const float* srow = scale + (long)o * ng;
+    if (I8) {
+      // A group is 64 weights, so an 8-aligned run of 8 never straddles one: the outer scale
+      // is constant across the chunk and the 8-wide load composes.
+      for (int c = slane; c < I8; c += 32) {
+        int k0 = c*8, g = k0>>6, r = k0&63;
+        device const uchar* lo = wr + (long)g*24; device const uchar* hi = lo + 16;
+        uchar l0 = lo[r>>2], l1 = lo[(r>>2)+1], h = hi[r>>3];
+        float4 w0 = float4(float(int(( l0     &3u)|(( h    &1u)<<2))-4),
+                           float(int(((l0>>2) &3u)|(((h>>1)&1u)<<2))-4),
+                           float(int(((l0>>4) &3u)|(((h>>2)&1u)<<2))-4),
+                           float(int(((l0>>6) &3u)|(((h>>3)&1u)<<2))-4));
+        float4 w1 = float4(float(int(( l1     &3u)|(((h>>4)&1u)<<2))-4),
+                           float(int(((l1>>2) &3u)|(((h>>5)&1u)<<2))-4),
+                           float(int(((l1>>4) &3u)|(((h>>6)&1u)<<2))-4),
+                           float(int(((l1>>6) &3u)|(((h>>7)&1u)<<2))-4));
+        acc += (dot(w0,x4[2*c]) + dot(w1,x4[2*c+1])) * srow[g];
+      }
+    } else {
+    for (int g = 0; g < ng; g++) {                  // scale is per group: fold it in per group
+      device const uchar* lo = wr + (long)g*24; device const uchar* hi = lo + 16;
+      int base = g*64, n = min(64, I - base);
+      float part = 0.0f;
+      for (int k = slane; k < n; k += 32) {
+        uint v = ((lo[k>>2] >> ((k&3)*2)) & 3u) | (((hi[k>>3] >> (k&7)) & 1u) << 2);
+        part += float(int(v) - 4) * xr[base+k];
+      }
+      acc += part * srow[g];
+    }
+    }
   } else {                                          // f32
     device const float* wr = (device const float*)(w) + (long)o * I;
     device const float4* w4 = (device const float4*)wr;
@@ -60,7 +93,7 @@ kernel void mm_gemv(device const uchar* w      [[buffer(0)]],   // raw weight by
     for (int i = I8*8 + slane; i < I; i += 32) acc += wr[i] * xr[i];
   }
   acc = simd_sum(acc);
-  if (slane == 0) y[row] = acc * scale[o];
+  if (slane == 0) y[row] = (fmt == 5) ? acc : acc * scale[o];   // fmt 5 already scaled per group
 }
 
 // Batched bindless expert GEMV: each row gr belongs to expert erow[gr], whose weight and
@@ -89,13 +122,44 @@ kernel void moe_gemv(device const ulong* waddr [[buffer(0)]], device const ulong
       float4 w1=float4(float(int(b.z&0xF)-8),float(int(b.z>>4)-8),float(int(b.w&0xF)-8),float(int(b.w>>4)-8));
       acc+=dot(w0,x4[2*c])+dot(w1,x4[2*c+1]); }
     for(int i=K8*8+slane;i<K;i+=32){ uchar b=w[i>>1]; int v=(i&1)?(b>>4):(b&0xF); acc+=float(v-8)*xr[i]; }
+  } else if (fmt == 5) {                            // int3-g64, scale per (row,group)
+    int ng=(K+63)/64; device const uchar* w=(device const uchar*)(waddr[e])+(long)o*(long)ng*24;
+    device const float* srow = sc + (long)o*ng;
+    if (K8) {
+      // A group is 64 weights, so an 8-aligned run of 8 never straddles one: the outer
+      // scale is constant across the chunk and the 8-wide load composes.
+      for(int c=slane;c<K8;c+=32){
+        int k0=c*8, g=k0>>6, r=k0&63;
+        device const uchar* lo=w+(long)g*24; device const uchar* hi=lo+16;
+        uchar l0=lo[r>>2], l1=lo[(r>>2)+1], h=hi[r>>3];
+        float4 w0=float4(float(int(( l0     &3u)|(( h    &1u)<<2))-4),
+                         float(int(((l0>>2) &3u)|(((h>>1)&1u)<<2))-4),
+                         float(int(((l0>>4) &3u)|(((h>>2)&1u)<<2))-4),
+                         float(int(((l0>>6) &3u)|(((h>>3)&1u)<<2))-4));
+        float4 w1=float4(float(int(( l1     &3u)|(((h>>4)&1u)<<2))-4),
+                         float(int(((l1>>2) &3u)|(((h>>5)&1u)<<2))-4),
+                         float(int(((l1>>4) &3u)|(((h>>6)&1u)<<2))-4),
+                         float(int(((l1>>6) &3u)|(((h>>7)&1u)<<2))-4));
+        acc += (dot(w0,x4[2*c]) + dot(w1,x4[2*c+1])) * srow[g];
+      }
+    } else {
+    for(int g=0; g<ng; g++){
+      device const uchar* lo=w+(long)g*24; device const uchar* hi=lo+16;
+      int base=g*64, n=min(64, K-base); float part=0.0f;
+      for(int k=slane;k<n;k+=32){
+        uint v=((lo[k>>2]>>((k&3)*2))&3u) | (((hi[k>>3]>>(k&7))&1u)<<2);
+        part += float(int(v)-4) * xr[base+k];
+      }
+      acc += part * srow[g];
+    }
+    }
   } else { device const char* w=(device const char*)(waddr[e])+(long)o*K;
     device const char4* w4=(device const char4*)w;
     for(int c=slane;c<K8;c+=32) acc+=dot(float4(w4[2*c]),x4[2*c])+dot(float4(w4[2*c+1]),x4[2*c+1]);
     for(int i=K8*8+slane;i<K;i+=32) acc+=float(w[i])*xr[i];
   }
   acc=simd_sum(acc);
-  if(slane==0) yout[row]=acc*sc[o];
+  if(slane==0) yout[row]=(fmt==5)?acc:acc*sc[o];
 }
 kernel void moe_silu(device float* g [[buffer(0)]], device const float* u [[buffer(1)]],
                      uint i [[thread_position_in_grid]]) { float v=g[i]; g[i]=(v/(1.0f+exp(-v)))*u[i]; }
@@ -423,7 +487,13 @@ static size_t fmt_bytes(int fmt, int I, int O) {
   if (fmt == 1) return (size_t)O * I;
   if (fmt == 2) return (size_t)O * ((I+1)/2);
   if (fmt == 3) return (size_t)O * ((I+3)/4);
+  if (fmt == 5) return (size_t)O * (size_t)((I+63)/64) * 24;   // int3-g64: 24B per 64-weight group
   return (size_t)O * I * sizeof(float);
+}
+// fmt 5 carries one f32 scale per (row, group); everything else is one per row.
+static size_t scale_bytes(int fmt, int I, int O) {
+  if (fmt == 5) return (size_t)O * (size_t)((I+63)/64) * sizeof(float);
+  return (size_t)O * sizeof(float);
 }
 
 // Wrap host memory zero-copy if page-aligned, else copy into a shared buffer.
@@ -590,14 +660,14 @@ extern "C" int  coli_metal_mem_info(size_t *used, size_t *total) {
 extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
                                  const void *weights, const float *scales,
                                  int fmt, int S, int I, int O) {
-  if (!g_dev || fmt < 0 || fmt > 3) return 0;
+  if (!g_dev || fmt < 0 || (fmt > 3 && fmt != 5)) return 0;
   @autoreleasepool {
     ColiMetalTensor *t = *tp;
     if (!t) {
       t = new ColiMetalTensor();
       t->fmt = fmt; t->I = I; t->O = O; t->wbytes = fmt_bytes(fmt, I, O);
       t->w = wrap(weights, t->wbytes);
-      t->s = wrap(scales, (size_t)O * sizeof(float));
+      t->s = wrap(scales, scale_bytes(fmt, I, O));
       *tp = t;
       g_tensor_count++; g_tensor_bytes += t->wbytes;
     }
@@ -960,7 +1030,7 @@ static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr, int R,
                          id<MTLBuffer> xg_buf, id<MTLBuffer> gg_buf, id<MTLBuffer> uu_buf, id<MTLBuffer> hh_buf) {
-  if (!g_dev || (fmt != 1 && fmt != 2)) return nil;
+  if (!g_dev || (fmt != 1 && fmt != 2 && fmt != 5)) return nil;
   if (g_resset_enabled) {   // E5: commit any pending slab adds before we may skip useResource:
     double t0 = mnow(); resset_flush(); g_t_resset_flush += mnow() - t0;   // METAL-RESSET line
   }

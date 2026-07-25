@@ -7,13 +7,30 @@
 #include <cmath>
 #include <vector>
 
-enum { F32=0, I8=1, I4=2, I2=3 };
+enum { F32=0, I8=1, I4=2, I2=3, I3G=5 };
 
 static void cpu_ref(int fmt, const void *W, const float *s, const float *x,
                     float *y, int S, int I, int O) {
   const int8_t *q8 = (const int8_t*)W; const uint8_t *q4 = (const uint8_t*)W;
   const float *qf = (const float*)W;
   int rb4=(I+1)/2, rb2=(I+3)/4;
+  if (fmt==I3G) {                       // int3-g64: 24B/group, one scale per (row,group)
+    int ng=(I+63)/64;
+    for (int o=0;o<O;o++) for (int si=0;si<S;si++){
+      const float *xr = x + (size_t)si*I; float acc=0;
+      for (int g=0; g<ng; g++){
+        const uint8_t *lo=q4+(size_t)o*ng*24+(size_t)g*24, *hi=lo+16;
+        int base=g*64, n = (I-base<64)?(I-base):64; float a=0;
+        for (int k=0;k<n;k++){
+          unsigned v=((lo[k>>2]>>((k&3)*2))&3u) | (((hi[k>>3]>>(k&7))&1u)<<2);
+          a += (float)((int)v-4) * xr[base+k];
+        }
+        acc += a*s[(size_t)o*ng+g];
+      }
+      y[(size_t)si*O+o]=acc;
+    }
+    return;
+  }
   for (int o=0;o<O;o++) for (int si=0;si<S;si++){
     const float *xr = x + (size_t)si*I; float acc=0;
     for (int i=0;i<I;i++){
@@ -29,14 +46,15 @@ static void cpu_ref(int fmt, const void *W, const float *s, const float *x,
 }
 
 static int run(int fmt, int O, int I, int S, const char *name) {
-  int rb4=(I+1)/2, rb2=(I+3)/4;
-  size_t wn = (fmt==I8)?(size_t)O*I : (fmt==I4)?(size_t)O*rb4 : (fmt==I2)?(size_t)O*rb2 : (size_t)O*I*sizeof(float);
+  int rb4=(I+1)/2, rb2=(I+3)/4, ng=(I+63)/64;
+  size_t wn = (fmt==I8)?(size_t)O*I : (fmt==I4)?(size_t)O*rb4 : (fmt==I2)?(size_t)O*rb2
+            : (fmt==I3G)?(size_t)O*ng*24 : (size_t)O*I*sizeof(float);
   std::vector<uint8_t> W(wn); std::vector<float> Wf;
   srand(99);
   if (fmt==F32){ Wf.resize((size_t)O*I); for(auto&v:Wf) v=((rand()%2000)-1000)/1000.f; }
   else for(auto&b:W) b=(uint8_t)((fmt==I8)?((rand()%255)-127):(rand()&0xFF));
   const void *Wp = (fmt==F32)?(const void*)Wf.data():(const void*)W.data();
-  std::vector<float> s(O), x((size_t)S*I), yr((size_t)S*O), yg((size_t)S*O);
+  std::vector<float> s((fmt==I3G)?(size_t)O*ng:(size_t)O), x((size_t)S*I), yr((size_t)S*O), yg((size_t)S*O);
   for(auto&v:s) v=(fmt==F32)?1.0f:(0.01f+(rand()%100)/10000.f);
   for(auto&v:x) v=((rand()%2000)-1000)/1000.f;
   cpu_ref(fmt, Wp, s.data(), x.data(), yr.data(), S, I, O);
@@ -251,6 +269,11 @@ int main(void) {
   fail |= run(I8, 2048,6144,4, "int8 gate/up S=4");
   fail |= run(I4, 2048,6144,7, "int4 gate/up S=7 (odd)");
   fail |= run(I4, 2050,6146,3, "int4 non-mult-4 dims");
+  fail |= run(I3G,2048,6144,1, "int3-g64 gate/up S=1");
+  fail |= run(I3G,6144,2048,1, "int3-g64 down S=1");
+  fail |= run(I3G,2048,6144,4, "int3-g64 gate/up S=4");
+  fail |= run(I3G,1024,6208,1, "int3-g64 partial tail group");
+  fail |= run(I3G,512, 100, 2, "int3-g64 tiny dim, ragged");
   printf("Metal batched moe_block tests:\n");
   fail |= run_moe({1,1,1,1,1,1,1,1}, "moe decode nb=8");
   fail |= run_moe({3,1,4,2,1,5},     "moe ragged nb=6");
