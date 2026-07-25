@@ -462,6 +462,15 @@ tests/bench_idot$(EXE): tests/bench_idot.c colibri.c st.h uring.h json.h tok.h t
 tests/bench_mla_simd$(EXE): tests/bench_mla_simd.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# bench_i3_metal: microbenchmark (CPU matmul_i3 vs the Metal fmt=5 MoE block on the batched
+# production path, #452), NOT a test gate. macOS only, build on demand: make tests/bench_i3_metal
+# The shim is there because colibri.c does not compile as Objective-C++ (implicit void*
+# conversions), so matmul_i3 is exposed from a C translation unit and linked against the .mm.
+tests/bench_i3_metal$(EXE): tests/bench_i3_metal.mm tests/bench_i3_shim.c backend_metal.o colibri.c backend_metal.h st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
+	$(CC) $(CFLAGS) -DCOLI_METAL -c tests/bench_i3_shim.c -o tests/bench_i3_shim.o
+	$(METALXX) -c tests/bench_i3_metal.mm -o tests/bench_i3_metal.o
+	$(METALXX) -x none tests/bench_i3_metal.o tests/bench_i3_shim.o backend_metal.o -framework Metal -framework Foundation -o $@ $(LDFLAGS)
+
 tests/test_uring$(EXE): tests/test_uring.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
