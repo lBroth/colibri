@@ -161,6 +161,14 @@ typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
                   * re-attaches. NULL for every individually-allocated slot. */
                  uint8_t *aslab; float *afslab; } ESlot;
 
+/* One subset, one format: moe_submit decodes gate, up and down with a single fmt, so an expert
+ * whose three projections disagree (mixed-precision container), or that disagrees with the
+ * subset the block is being built for, must stay on the CPU path. Harmless while the tree had
+ * two formats, load-bearing from the third on. */
+static inline int eslot_fmt_uniform(const ESlot *e, int fmt){
+    return e->g.fmt==fmt && e->u.fmt==fmt && e->d.fmt==fmt;
+}
+
 typedef struct {
     float **Lc, **Rc, **Ic;
     int *kv_start, max_t;
@@ -3176,6 +3184,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     if(idxs[(int64_t)s*K+kk]==eid){ cnt++; break; } \
                 if(!cnt) continue; \
                 if(mfmt<0) mfmt=e->g.fmt; \
+                if(!eslot_fmt_uniform(e,mfmt)) continue;   /* mixed-precision expert: CPU path */ \
                 MG[nbb]=e->g.fmt==1?(const void*)e->g.q8:(const void*)e->g.q4; \
                 MU[nbb]=e->u.fmt==1?(const void*)e->u.q8:(const void*)e->u.q4; \
                 MD[nbb]=e->d.fmt==1?(const void*)e->d.q8:(const void*)e->d.q4; \

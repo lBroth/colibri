@@ -43,7 +43,26 @@ static void unpack_i3(const uint8_t *q3, const float *s, float *dq, int O, int I
     }
 }
 
+
+/* The MoE GPU subset must reject an expert whose three projections disagree on the format,
+ * and one that disagrees with the subset it would join: moe_submit decodes all three with a
+ * single fmt, so a mixed-precision container would otherwise be decoded with the wrong layout. */
+static void test_subset_fmt_guard(void){
+    ESlot e; memset(&e, 0, sizeof e);
+    e.g.fmt = e.u.fmt = e.d.fmt = 5;
+    CHECK(eslot_fmt_uniform(&e, 5) == 1);      /* uniform int3 joins an int3 block */
+    CHECK(eslot_fmt_uniform(&e, 2) == 0);      /* same expert must not join an int4 block */
+    e.u.fmt = 2;                               /* mixed: up quantized differently */
+    CHECK(eslot_fmt_uniform(&e, 5) == 0);
+    e.u.fmt = 5; e.d.fmt = 1;                  /* mixed: down is int8 */
+    CHECK(eslot_fmt_uniform(&e, 5) == 0);
+    e.d.fmt = 5; e.g.fmt = 4;                  /* mixed: gate is grouped int4 */
+    CHECK(eslot_fmt_uniform(&e, 5) == 0);
+    printf("  subset fmt guard         ok\n");
+}
+
 int main(void){
+    test_subset_fmt_guard();
     const int Is[]={64,128,192,100,65,7168};   /* incl. short tail groups and one real GLM dim */
     enum { O=7, MAXI=7168 };
     static float w[(int64_t)O*MAXI], dq_ref[(int64_t)O*MAXI], dq_pk[(int64_t)O*MAXI];
